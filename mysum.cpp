@@ -1,215 +1,280 @@
-// Compile: g++ -std=c++17 -o my-sum mysum.cpp
-// Usage:   ./my-sum n m input.dat output.dat
-//   n = number of elements, m = number of processes (workers)
-//   Main process forks m children; children compute; main waits and writes output.
-
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <errno.h>
-#include <unistd.h>
-#include <sys/shm.h>
-#include <sys/ipc.h>
-#include <sys/types.h>
-#include <sys/wait.h>
 #include <iostream>
 #include <fstream>
+#include <string>
 #include <vector>
+#include <stdexcept>
+#include <cstdlib>
+#include <algorithm>
+#include <unistd.h>
+#include <sys/ipc.h>
+#include <sys/shm.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <sched.h>
 
 using namespace std;
 
-static void usage(const char* prog) {
-    cerr << "Usage: " << prog << " n m input.dat output.dat\n"
-         << "  n = number of elements\n"
-         << "  m = number of processes\n"
-         << "  input.dat  = file containing numbers\n"
-         << "  output.dat = file to write prefix sum\n";
-}
+/*
+ReadFromFile method reads n integers from a file and returns them in a vector
 
-// Validate and exit safely on error.
-static int validate(int n, int m, const char* input_path) {
-    if (n <= 0) {
-        cerr << "Error: n must be > 0 (got " << n << ")\n";
-        return -1;
+filename: is the name of the file containing the number of elements.
+n: is the amount given by the user that is the size of the array to be read from the file.
+*/
+vector<long long> ReadFromFile(const string &filename, int n){
+    ifstream in(filename);
+    if(!in){
+        cerr << "cannot open file\n";
+        exit(EXIT_FAILURE);
     }
-    if (m <= 0) {
-        cerr << "Error: m must be > 0 (got " << m << ")\n";
-        return -1;
-    }
-    if (n < m) {
-        cerr << "Error: n must be >= m (n=" << n << ", m=" << m << ")\n";
-        return -1;
-    }
-    ifstream in(input_path);
-    if (!in) {
-        cerr << "Error: input file does not exist or cannot be opened: " << input_path << "\n";
-        return -1;
-    }
+
+    vector<long long> A;
+
     long long x;
-    int count = 0;
-    while (in >> x && count < n)
-        count++;
-    in.close();
-    if (count < n) {
-        cerr << "Error: input file contains " << count << " numbers; need at least " << n << "\n";
-        return -1;
+    while(in >> x){
+        A.push_back(x);
+        if((int)A.size() == n){
+            break;
+        }
     }
-    return 0;
+    return A;
+}
+/*
+WriteToFile method writes the results of Hillis and Steele's algorithm 
+after the program is concluded into a seperate txt file named "output.txt".
+
+B: it is a pointer to the array containing the final values after the algorithm is completed.
+n: number of elements in the array B to be written.
+filename: the filename the results will be outputted into
+*/
+void WriteToFile(const long long *B, int n, const string &filename){
+    ofstream out(filename.c_str());
+    if(!out){
+        cerr << "cannot output to a file\n";
+        exit(EXIT_FAILURE);
+    }
+
+    for(int i = 0; i < n; i++){
+        out << B[i];
+        if(i < n - 1) out << " ";
+    }
+    out << "\n";
 }
 
-static void load_input(const char* input_path, int n, vector<long long>& out) {
-    out.resize(n);
-    ifstream in(input_path);
-    for (int i = 0; i < n; i++)
-        in >> out[i];
-    in.close();
-}
+/*
+arriveAndWait method is used for announcing that the process has reached a synchronization 
+and it will wait until all m processes have reached that same point.
 
-// Shared memory layout (shmget):
-//   int n, m;
-//   int next_rank, rank_lock;  (worker rank assignment, spinlock in shared memory)
-//   padding to 16
-//   long long A[n], buf0[n], buf1[n]
-//   int barrier_count, barrier_phase (barrier variables in shared memory)
-#define OFF_N(sz)            0
-#define OFF_M(sz)            4
-#define OFF_NEXTRANK(sz)     8
-#define OFF_RANKLOCK(sz)     12
-#define OFF_A(sz)            16
-#define OFF_BUF0(sz)         (16 + (size_t)(sz) * 8)
-#define OFF_BUF1(sz)          (16 + (size_t)(sz) * 16)
-#define OFF_BARRIER_COUNT(sz) (16 + (size_t)(sz) * 24)
-#define OFF_BARRIER_PHASE(sz) (16 + (size_t)(sz) * 24 + 4)
-#define SHM_SIZE(sz)          (OFF_BARRIER_PHASE(sz) + 8)
+id: this is the method caller's process index, we are using this to store the process's arrival.
+m: the total number of worker proceeses repeadtly checking this number till all have arrived before realeasing the barrier.
+counter_ptr: this is a pointer to a shared integer storing the current barrier's phase.
+arrived_array: this is a pointer to a shared array where the most recent barrier phase reached by the process is recorded.
+*/
+static inline void arriveAndWait(int id, int m, volatile int* phase_ptr, volatile int* arrived_array)
+{
+    // Each barrier has a "phase number" so the same barrier can be reused many times.
+    int phase_nmr = *phase_ptr;
 
-// Barrier using only shared memory (no threads, no pthread, no semaphores).
-// barrier_count and barrier_phase are in shared memory. Count increment is atomic.
-static void barrier(volatile int* barrier_count, volatile int* barrier_phase, int m) {
-    int my_phase = *barrier_phase;
-    int arrived = __sync_fetch_and_add((int*)barrier_count, 1) + 1;
-    if (arrived == m) {
-        *barrier_count = 0;
-        *barrier_phase = my_phase + 1;
-        __sync_synchronize();
-    } else {
-        while (*barrier_phase == my_phase)
-            ;
+    // Announce: "worker id has arrived at phase counter"
+    arrived_array[id] = phase_nmr;
+
+    // Wait until every worker has arrived (i.e., arrived_array[j] >= counter for all j).
+    while (true) {
+        bool all = true;
+        for (int j = 0; j < m; j++) {
+            if (arrived_array[j] < phase_nmr) {
+                all = false;
+            }
+        }
+        if (all) break;
+    }
+
+    // Worker 0 acts like the "coordinator" that advances the phase number.
+    if (id == 0) {
+        *phase_ptr = phase_nmr + 1;
+    }
+
+    // Everyone waits until the phase number is advanced before leaving the barrier.
+    while (*phase_ptr == phase_nmr) {
+        // Give CPU time to other processes while spinning.
+        sched_yield();
     }
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 5) {
-        usage(argv[0]);
-        return 1;
+
+// computing log2n 
+// n: postive integer
+int ceillog2(int n){
+    int p = 0;
+    int x = 1;
+    while(x < n){
+        x <<= 1;
+        p++;
+    }
+    return p;
+}
+
+/*
+Code executed by each child process to compute prefix sums in parallel in Hillis-Steele rounds.
+Each Worker updates only its own chunk of the array in shared memory.
+
+id: the worker index number
+n: number of elements in the array
+m: total number of worker processes
+arr0: shared array buffer 1 
+arr1: shared array buffer 2
+counter_ptr: shared barrier phase integer used by arriveAndWait
+arrived_array: shared barrier array used by arriveAndWait
+*/
+void worker(int id, int n, int m, long long* arr0, long long* arr1, volatile int* counter_ptr, volatile int* arrived_array)
+{
+    // Split the n elements into m chunks.
+    // Example: if n=10 and m=3, chunk = 4, ranges are [0..3], [4..7], [8..9]
+    int chunk = (n + m - 1) / m;
+    int start = id * chunk;
+    int end   = min(start + chunk, n);
+
+    int P = ceillog2(n); // number of rounds
+
+    // src is the array we read from, dst is the array we write to this round.
+    long long* src = arr0;
+    long long* dst = arr1;
+
+    // Run rounds 1..P with offsets 1,2,4,8,...
+    for (int p = 1; p <= P; p++) {
+        int offset = 1 << (p - 1);
+
+        // Compute only my assigned portion [start, end).
+        // Each position i adds the value from i-offset (if that exists).
+        for (int i = start; i < end; i++) {
+            if (i < offset) {
+                dst[i] = src[i];
+            } else {
+                dst[i] = src[i] + src[i - offset];
+            }
+        }
+
+        // Barrier #1: ensure every worker finished writing dst before anyone reads it.
+        arriveAndWait(id, m, counter_ptr, arrived_array);
+
+        // Swap buffers locally: next round reads the updated results.
+        long long* tmp = src;
+        src = dst;
+        dst = tmp;
+
+        // Barrier #2: ensure everyone swapped before next round begins.
+        arriveAndWait(id, m, counter_ptr, arrived_array);
+    }
+
+    // Child process ends here.
+    // _exit avoids re-running parent cleanup/iostream flushing in the child.
+    _exit(0);
+}
+
+/*
+Read input array from file, create shared memory for synchronizartion variables,
+for m child processes to compute prefix sum in parallel, wait for children and then write to results in filename
+
+argc: the count of the array of argv
+argv: user input of n m input output
+*/
+int main(int argc, char* argv[]){
+    if(argc != 5){
+        return EXIT_FAILURE;
     }
 
     int n = atoi(argv[1]);
     int m = atoi(argv[2]);
-    const char* input_path  = argv[3];
-    const char* output_path = argv[4];
 
-    if (validate(n, m, input_path) != 0)
-        return 1;
-
-    vector<long long> input_data;
-    load_input(input_path, n, input_data);
-
-    // Shared memory: array, temporary arrays, barrier variables
-    size_t shm_size = SHM_SIZE(n);
-    int shmid = shmget(IPC_PRIVATE, shm_size, IPC_CREAT | 0666);
-    if (shmid == -1) {
-        cerr << "Error: shmget failed: " << strerror(errno) << "\n";
-        return 1;
+    if (n <= 0 || m <= 0) {
+        cerr << "m and n should be greater than 0\n";
+        return EXIT_FAILURE;
+    }
+    if (n < m) {
+        cerr << "m cannot be greater than n\n";
+        return EXIT_FAILURE;
     }
 
-    char* shm = (char*)shmat(shmid, nullptr, 0);
-    if (shm == (char*)-1) {
-        cerr << "Error: shmat failed: " << strerror(errno) << "\n";
-        shmctl(shmid, IPC_RMID, nullptr);
-        return 1;
+    // Compute how much shared memory we need:
+    // - Two arrays of long long (arr0 and arr1), each length n
+    // - One int for the barrier phase counter
+    // - One int array of length m for arrivals
+    size_t bytes =
+        2ull * (size_t)n * sizeof(long long)  // arr0 + arr1
+      + 1ull * sizeof(int)                    // phase counter
+      + (size_t)m * sizeof(int);              // arrived[m]
+
+    // Create a private shared-memory segment (only this program’s processes can use it).
+    int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
+    if (shmid < 0) {
+        perror("shmget");
+        return EXIT_FAILURE;
     }
 
-    *(int*)(shm + OFF_N(n)) = n;
-    *(int*)(shm + OFF_M(n)) = m;
-    *(int*)(shm + OFF_NEXTRANK(n)) = 0;
-    *(int*)(shm + OFF_RANKLOCK(n)) = 0;
+    // Attach shared memory into this process’s address space.
+    void* shared_memory = shmat(shmid, NULL, 0);
+    if (shared_memory == (void*)-1) {
+        perror("shmat");
+        return EXIT_FAILURE;
+    }
 
-    long long* A    = (long long*)(shm + OFF_A(n));
-    long long* buf0 = (long long*)(shm + OFF_BUF0(n));
-    long long* buf1 = (long long*)(shm + OFF_BUF1(n));
-    for (int i = 0; i < n; i++)
-        A[i] = buf0[i] = input_data[i];
+    // Read input data from file
+    vector<long long> data = ReadFromFile(argv[3], n);
 
-    volatile int* barrier_count = (volatile int*)(shm + OFF_BARRIER_COUNT(n));
-    volatile int* barrier_phase  = (volatile int*)(shm + OFF_BARRIER_PHASE(n));
-    *barrier_count = 0;
-    *barrier_phase = 0;
+    // Lay out the shared memory in this order:
+    // [arr0 (n long long)] [arr1 (n long long)] [phase (int)] [arrived (m int)]
+    long long* arr0 = (long long*) shared_memory;
+    long long* arr1 = arr0 + n;
 
-    // Main process: fork m children (workers). Main does not compute.
-    for (int i = 0; i < m; i++) {
+    volatile int* phase_ptr = (volatile int*) (arr1 + n);
+    volatile int* arrived   = phase_ptr + 1;
+
+    // Initialize shared arrays:
+    // arr0 starts as the original input; arr1 is just a scratch buffer.
+    for (int i = 0; i < n; i++) {
+        arr0[i] = data[i];
+        arr1[i] = 0;
+    }
+
+    // Initialize barrier state:
+    *phase_ptr = 0;
+    for (int j = 0; j < m; j++) {
+        arrived[j] = -1; // “has not reached phase 0 yet”
+    }
+
+    // Fork m worker processes.
+    for (int id = 0; id < m; id++) {
         pid_t pid = fork();
-        if (pid == -1) {
-            cerr << "Error: fork failed: " << strerror(errno) << "\n";
-            shmdt(shm);
-            shmctl(shmid, IPC_RMID, nullptr);
-            return 1;
+        if (pid < 0) {
+            // Fork failed: parent cleans up and exits.
+            perror("fork");
+            for (int k = 0; k < id; k++) wait(NULL);
+            shmdt(shared_memory);
+            return EXIT_FAILURE;
         }
+
         if (pid == 0) {
-            // Child: worker process. All use same shared memory (already attached).
-            volatile int* rank_lock = (volatile int*)(shm + OFF_RANKLOCK(n));
-            while (__sync_lock_test_and_set((int*)rank_lock, 1))
-                ;
-            int rank = (*(int*)(shm + OFF_NEXTRANK(n)))++;
-            __sync_lock_release((int*)rank_lock);
-
-            int n_elems = *(int*)(shm + OFF_N(n));
-            int m_proc  = *(int*)(shm + OFF_M(n));
-            int start   = rank * n_elems / m_proc;
-            int end     = (rank + 1) * n_elems / m_proc;
-
-            // Hillis-Steele: log n rounds; each round O(n/m) per process + barrier O(m) -> total O((n log n)/m + m log n)
-            int iter = 0;
-            for (int offset = 1; offset < n_elems; offset *= 2) {
-                long long* in_buf  = (iter % 2 == 0) ? buf0 : buf1;
-                long long* out_buf = (iter % 2 == 0) ? buf1 : buf0;
-                for (int i = start; i < end; i++) {
-                    if (i < offset)
-                        out_buf[i] = in_buf[i];
-                    else
-                        out_buf[i] = in_buf[i] + in_buf[i - offset];
-                }
-                barrier(barrier_count, barrier_phase, m_proc);
-                iter++;
-            }
-            shmdt(shm);
-            exit(0);
+            // Child: run worker logic for this id, then exit.
+            worker(id, n, m, arr0, arr1, phase_ptr, arrived);
+            _exit(0);
         }
+        // Parent continues loop to fork the next child.
     }
 
-    // Main process: wait for all children
-    for (int i = 0; i < m; i++)
-        wait(nullptr);
-
-    // Main process: write final result (result is in buf0 or buf1 after last iteration)
-    int num_iters = 0;
-    for (int offset = 1; offset < n; offset *= 2)
-        num_iters++;
-    long long* result = (num_iters % 2 == 0) ? buf0 : buf1;
-
-    FILE* out = fopen(output_path, "w");
-    if (!out) {
-        cerr << "Error: cannot open output file: " << output_path << "\n";
-        shmdt(shm);
-        shmctl(shmid, IPC_RMID, nullptr);
-        return 1;
+    // Parent waits until all children finish.
+    for (int i = 0; i < m; i++) {
+        wait(NULL);
     }
-    for (int i = 0; i < n; i++)
-        fprintf(out, "%s%lld", i ? " " : "", result[i]);
-    fprintf(out, "\n");
-    fclose(out);
 
-    // Clean shared memory and exit cleanly
-    shmdt(shm);
-    shmctl(shmid, IPC_RMID, nullptr);
-    return 0;
+    // Decide which shared buffer contains the final answer.
+    // If we swapped an odd number of times, result ends in arr1; otherwise arr0.
+    int P = ceillog2(n);
+    const long long* result = (P % 2 == 0) ? arr0 : arr1;
+
+    // Write final result
+    WriteToFile(result, n, argv[4]);
+
+    // Detach shared memory from parent
+    shmdt(shared_memory);
+
+    return EXIT_SUCCESS;
 }
