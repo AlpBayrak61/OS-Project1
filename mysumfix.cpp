@@ -14,7 +14,12 @@
 
 using namespace std;
 
-// Read n numbers from a file into a vector
+/*
+ReadFromFile method reads n integers from a file and returns them in a vector
+
+filename: is the name of the file containing the number of elements.
+n: is the amount given by the user that is the size of the array to be read from the file.
+*/
 vector<long long> ReadFromFile(const string &filename, int n){
     ifstream in(filename);
     if(!in){
@@ -34,7 +39,14 @@ vector<long long> ReadFromFile(const string &filename, int n){
     return A;
 }
 
-// Write n numbers from an array into a file
+/*
+WriteToFile method writes the results of Hillis and Steele's algorithm 
+after the program is concluded into a seperate txt file named "output.txt".
+
+B: it is a pointer to the array containing the final values after the algorithm is completed.
+n: number of elements in the array B to be written.
+filename: the filename the results will be outputted into
+*/
 void WriteToFile(const long long *B, int n, const string &filename){
     ofstream out(filename.c_str());
     if(!out){
@@ -49,11 +61,19 @@ void WriteToFile(const long long *B, int n, const string &filename){
     out << "\n";
 }
 
-// Simple barrier so all m processes wait for each other
+/*
+arriveAndWait method is used for announcing that the process has reached a synchronization 
+and it will wait until all m processes have reached that same point.
+
+id: this is the method caller's process index, we are using this to store the process's arrival.
+m: the total number of worker proceeses repeadtly checking this number till all have arrived before realeasing the barrier.
+phase_ptr: this is a pointer to a shared integer storing the current barrier's phase.
+arrived_array: this is a pointer to a shared array where the most recent barrier phase reached by the process is recorded.
+*/
 static inline void arriveAndWait(int id, int m, volatile int* phase_ptr, volatile int* arrived_array)
 {
+    volatile int round = 0;
     int phase_nmr = *phase_ptr;
-
     arrived_array[id] = phase_nmr;
 
     while (true) {
@@ -61,6 +81,7 @@ static inline void arriveAndWait(int id, int m, volatile int* phase_ptr, volatil
         for (int j = 0; j < m; j++) {
             if (arrived_array[j] < phase_nmr) {
                 all = false;
+                break;
             }
         }
         if (all) break;
@@ -71,11 +92,12 @@ static inline void arriveAndWait(int id, int m, volatile int* phase_ptr, volatil
     }
 
     while (*phase_ptr == phase_nmr) {
-        sched_yield();
+        round++;
     }
 }
 
 // Small helper to compute ceil(log2(n))
+// n: postive integer
 int ceillog2(int n){
     int p = 0;
     int x = 1;
@@ -86,47 +108,62 @@ int ceillog2(int n){
     return p;
 }
 
-// Code run by each child process to help build the prefix sums
-void worker(int id, int n, int m, long long* arr0, long long* arr1, volatile int* counter_ptr, volatile int* arrived_array)
+/*
+Code executed by each child process to compute prefix sums in parallel in Hillis-Steele rounds.
+Each Worker updates only its own chunk of the array in shared memory.
+
+id: the worker index number
+n: number of elements in the array
+m: total number of worker processes
+arr0: shared array buffer 1 
+arr1: shared array buffer 2
+phase_otr: shared barrier phase integer used by arriveAndWait
+arrived_array: shared barrier array used by arriveAndWait
+*/
+void worker(int id, int n, int m, long long* arr0, long long* arr1, volatile int* phase_ptr, volatile int* arrived_array)
 {
-    // Split the n elements into m chunks
     int chunk = (n + m - 1) / m;
     int start = id * chunk;
     int end   = min(start + chunk, n);
 
-    int P = ceillog2(n);
+    int x = ceillog2(n);
 
-    long long* src = arr0;
-    long long* dst = arr1;
+    long long* read = arr0;
+    long long* write = arr1;
 
-    // Do P rounds of the Hillis-Steele prefix sum algorithm
-    for (int p = 1; p <= P; p++) {
+    for (int p = 1; p <= x; p++) {
         int offset = 1 << (p - 1);
 
-        // Only work on this worker's slice [start, end)
         for (int i = start; i < end; i++) {
             if (i < offset) {
-                dst[i] = src[i];
+                write[i] = read[i];
             } else {
-                dst[i] = src[i] + src[i - offset];
+                write[i] = read[i] + read[i - offset];
             }
         }
 
-        arriveAndWait(id, m, counter_ptr, arrived_array);
+        arriveAndWait(id, m, phase_ptr, arrived_array);
 
-        long long* tmp = src;
-        src = dst;
-        dst = tmp;
+        long long* tmp = read;
+        read = write;
+        write = tmp;
 
-        arriveAndWait(id, m, counter_ptr, arrived_array);
+        arriveAndWait(id, m, phase_ptr, arrived_array);
     }
 
     _exit(0);
 }
 
-// Main program: set up shared memory, start workers, then write result
+/*
+Read input array from file, create shared memory for synchronizartion variables,
+for m child processes to compute prefix sum in parallel, wait for children and then write to results in filename
+
+argc: the count of the array of argv
+argv: user input of n m input output
+*/
 int main(int argc, char* argv[]){
-    // Expect: program n m inputfile outputfile
+    const long long* result;
+
     if(argc != 5){
         return EXIT_FAILURE;
     }
@@ -143,11 +180,7 @@ int main(int argc, char* argv[]){
         return EXIT_FAILURE;
     }
 
-    // Figure out how many bytes of shared memory we need
-    size_t bytes =
-        2ull * (size_t)n * sizeof(long long)  +
-        1ull * sizeof(int)                    +
-        (size_t)m * sizeof(int);
+    size_t bytes = 2ull * (size_t)n * sizeof(long long)  + 1ull * sizeof(int) + (size_t)m * sizeof(int);
 
     int shmid = shmget(IPC_PRIVATE, bytes, IPC_CREAT | 0600);
     if (shmid < 0) {
@@ -198,8 +231,13 @@ int main(int argc, char* argv[]){
         wait(NULL);
     }
 
-    int P = ceillog2(n);
-    const long long* result = (P % 2 == 0) ? arr0 : arr1;
+    int x = ceillog2(n);
+    
+    if(x % 2 == 0){
+        result = arr0;
+    } else {
+        result = arr1;
+    }
 
     WriteToFile(result, n, argv[4]);
 
